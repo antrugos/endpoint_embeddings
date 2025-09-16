@@ -1,7 +1,8 @@
 import os
 import requests
+import numpy as np
 from fastapi import FastAPI, Request
-
+from sklearn.metrics.pairwise import cosine_similarity
 app = FastAPI()
 
 # ============================
@@ -13,6 +14,11 @@ BASE_URL = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
 HF_API_URL = "https://api-inference.huggingface.co/models/Antrugos/namuywam-es-embeddings"
 HEADERS = {"Authorization": f"Bearer {HF_TOKEN}"}
+
+gum_texts = [...]  # lista de gum de tu dataset
+es_texts = [...]   # lista de español
+gum_embeddings = np.load("gum_embeddings.npy")
+es_embeddings = np.load("es_embeddings.npy")
 
 # ============================
 # 2. Funciones auxiliares
@@ -26,15 +32,15 @@ def send_message(chat_id, text):
     except Exception as e:
         print(f"Error al enviar mensaje a Telegram: {e}")
 
-def query_hf(texts):
-    """
-    Envía texto a Hugging Face Inference API.
-    `texts` debe ser una lista [texto1, texto2].
-    """
-    payload = {"inputs": texts}
+def query_hf(text: str):
+    """Devuelve embedding de Hugging Face API para un texto."""
+    payload = {"inputs": text}
     response = requests.post(HF_API_URL, headers=HEADERS, json=payload)
     if response.status_code == 200:
-        return response.json()
+        data = response.json()
+        if isinstance(data, list) and "embedding" in data[0]:
+            return data[0]["embedding"]
+        return data  # fallback
     else:
         print("Error HF:", response.text)
         return None
@@ -61,18 +67,20 @@ async def webhook(request: Request):
         direction = detect_direction(user_message)
 
         if direction == "es-nmw":
-            # Comparar entrada con lista Namuy-Wam
-            # En este caso mandamos pares [es, gum] a HF para similitud
-            result = query_hf([user_message, "Traducción al Namuy-Wam"])
-            if result:
-                send_message(chat_id, f"Traducción ES→NMW: {result}")
+            emb = query_hf(user_message)
+            if emb:
+                sims = cosine_similarity([emb], gum_embeddings)[0]
+                idx = np.argmax(sims)
+                send_message(chat_id, f"Traducción ES→NMW: {gum_texts[idx]}")
             else:
-                send_message(chat_id, "Error al traducir con Hugging Face.")
+                send_message(chat_id, "Error al obtener embedding.")
         else:
-            result = query_hf([user_message, "Traducción al Español"])
-            if result:
-                send_message(chat_id, f"Traducción NMW→ES: {result}")
+            emb = query_hf(user_message)
+            if emb:
+                sims = cosine_similarity([emb], es_embeddings)[0]
+                idx = np.argmax(sims)
+                send_message(chat_id, f"Traducción NMW→ES: {es_texts[idx]}")
             else:
-                send_message(chat_id, "Error al traducir con Hugging Face.")
+                send_message(chat_id, "Error al obtener embedding.")
 
     return {"status": "ok"}
