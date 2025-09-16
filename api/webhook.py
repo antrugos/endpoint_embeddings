@@ -1,5 +1,6 @@
 import os
 import requests
+import json
 import numpy as np
 from fastapi import FastAPI, Request
 from sklearn.metrics.pairwise import cosine_similarity
@@ -15,14 +16,16 @@ BASE_URL = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 HF_API_URL = "https://api-inference.huggingface.co/models/Antrugos/namuywam-es-embeddings"
 HEADERS = {"Authorization": f"Bearer {HF_TOKEN}"}
 
-gum_texts = [...]  # lista de gum de tu dataset
-es_texts = [...]   # lista de español
-gum_embeddings = np.load("gum_embeddings.npy")
-es_embeddings = np.load("es_embeddings.npy")
+# En Vercel, __file__ apunta a /var/task/api/webhook.py → subimos al root
+BASE_DIR = os.path.dirname(os.path.dirname(__file__))
 
 # ============================
 # 2. Funciones auxiliares
 # ============================
+def normalize(vecs: np.ndarray) -> np.ndarray:
+    """Normaliza embeddings fila por fila"""
+    return vecs / np.linalg.norm(vecs, axis=1, keepdims=True)
+
 def send_message(chat_id, text):
     """Envía mensaje a Telegram"""
     url = f"{BASE_URL}/sendMessage"
@@ -38,9 +41,16 @@ def query_hf(text: str):
     response = requests.post(HF_API_URL, headers=HEADERS, json=payload)
     if response.status_code == 200:
         data = response.json()
-        if isinstance(data, list) and "embedding" in data[0]:
-            return data[0]["embedding"]
-        return data  # fallback
+        try:
+            # Caso 1: API devuelve [{"embedding": [...]}]
+            if isinstance(data, list) and isinstance(data[0], dict) and "embedding" in data[0]:
+                return np.array(data[0]["embedding"], dtype=np.float32)
+            # Caso 2: API devuelve [[...]]
+            elif isinstance(data, list) and isinstance(data[0], list):
+                return np.array(data[0], dtype=np.float32)
+        except Exception as e:
+            print("Error parsing embedding:", e)
+            return None
     else:
         print("Error HF:", response.text)
         return None
@@ -53,7 +63,19 @@ def detect_direction(text: str) -> str:
         return "es-nmw"
 
 # ============================
-# 3. Endpoint webhook
+# 3. load embeddings
+# ============================
+gum_embeddings = normalize(np.load(os.path.join(BASE_DIR, "data/gum_embeddings.npy")))
+es_embeddings = normalize(np.load(os.path.join(BASE_DIR, "data/es_embeddings.npy")))
+
+with open(os.path.join(BASE_DIR, "data/gum_texts.json"), encoding="utf-8") as f:
+    gum_texts = json.load(f)
+
+with open(os.path.join(BASE_DIR, "data/es_texts.json"), encoding="utf-8") as f:
+    es_texts = json.load(f)
+
+# ============================
+# 4. Endpoint webhook
 # ============================
 @app.post("/api/webhook")
 async def webhook(request: Request):
@@ -66,21 +88,18 @@ async def webhook(request: Request):
 
         direction = detect_direction(user_message)
 
+        emb = query_hf(user_message)
+        if emb is None:
+            send_message(chat_id, "⚠️ No se pudo obtener embedding desde Hugging Face.")
+            return {"status": "error"}
+        
         if direction == "es-nmw":
-            emb = query_hf(user_message)
-            if emb:
-                sims = cosine_similarity([emb], gum_embeddings)[0]
-                idx = np.argmax(sims)
-                send_message(chat_id, f"Traducción ES→NMW: {gum_texts[idx]}")
-            else:
-                send_message(chat_id, "Error al obtener embedding.")
+            sims = cosine_similarity([emb], gum_embeddings)[0]
+            idx = int(np.argmax(sims))
+            send_message(chat_id, f"Traducción ES→NMW: {gum_texts[idx]}")
         else:
-            emb = query_hf(user_message)
-            if emb:
-                sims = cosine_similarity([emb], es_embeddings)[0]
-                idx = np.argmax(sims)
-                send_message(chat_id, f"Traducción NMW→ES: {es_texts[idx]}")
-            else:
-                send_message(chat_id, "Error al obtener embedding.")
+            sims = cosine_similarity([emb], es_embeddings)[0]
+            idx = int(np.argmax(sims))
+            send_message(chat_id, f"Traducción NMW→ES: {es_texts[idx]}")
 
     return {"status": "ok"}
