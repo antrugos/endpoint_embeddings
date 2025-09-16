@@ -13,8 +13,11 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 HF_TOKEN = os.getenv("HF_TOKEN")  # Hugging Face API Token
 BASE_URL = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
-HF_API_URL = "https://api-inference.huggingface.co/models/Antrugos/namuywam-es-embeddings"
-HEADERS = {"Authorization": f"Bearer {HF_TOKEN}"}
+HF_API_URL = "https://jecwd9rddkv39uoi.us-east-1.aws.endpoints.huggingface.cloud"
+HEADERS = {
+    "Authorization": f"Bearer {HF_TOKEN}",
+    "Content-Type": "application/json"
+}
 
 # En Vercel, __file__ apunta a /var/task/api/webhook.py → subimos al root
 BASE_DIR = os.path.dirname(os.path.dirname(__file__))
