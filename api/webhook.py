@@ -2,9 +2,9 @@ import os
 import requests
 import json
 import numpy as np
+from http.server import BaseHTTPRequestHandler
 from fastapi import FastAPI, Request
-from sklearn.metrics.pairwise import cosine_similarity
-app = FastAPI()
+from urllib.parse import parse_qs
 
 # ============================
 # 1. Configuración
@@ -19,90 +19,153 @@ HEADERS = {
     "Content-Type": "application/json"
 }
 
-# En Vercel, __file__ apunta a /var/task/api/webhook.py → subimos al root
-BASE_DIR = os.path.dirname(os.path.dirname(__file__))
-
-# ============================
-# 2. Funciones auxiliares
-# ============================
-def normalize(vecs: np.ndarray) -> np.ndarray:
-    """Normaliza embeddings fila por fila"""
-    return vecs / np.linalg.norm(vecs, axis=1, keepdims=True)
-
-def send_message(chat_id, text):
-    """Envía mensaje a Telegram"""
-    url = f"{BASE_URL}/sendMessage"
-    payload = {"chat_id": chat_id, "text": text}
-    try:
-        requests.post(url, json=payload)
-    except Exception as e:
-        print(f"Error al enviar mensaje a Telegram: {e}")
-
-def query_hf(text: str):
-    """Devuelve embedding de Hugging Face API para un texto."""
-    payload = {"inputs": text}
-    response = requests.post(HF_API_URL, headers=HEADERS, json=payload)
-    if response.status_code == 200:
-        data = response.json()
-        try:
-            # Caso 1: API devuelve [{"embedding": [...]}]
-            if isinstance(data, list) and isinstance(data[0], dict) and "embedding" in data[0]:
-                return np.array(data[0]["embedding"], dtype=np.float32)
-            # Caso 2: API devuelve [[...]]
-            elif isinstance(data, list) and isinstance(data[0], list):
-                return np.array(data[0], dtype=np.float32)
-        except Exception as e:
-            print("Error parsing embedding:", e)
-            return None
-    else:
-        print("Error HF:", response.text)
-        return None
-
-def detect_direction(text: str) -> str:
-    """Heurística simple para decidir idioma origen"""
-    if any(ch in text for ch in ["ѳ", "ѫ", "ѯ", "ts", "tik", "pak"]):
-        return "nmw-es"
-    else:
-        return "es-nmw"
-
-# ============================
-# 3. load embeddings
-# ============================
-gum_embeddings = normalize(np.load(os.path.join(BASE_DIR, "data/gum_embeddings.npy")))
-es_embeddings = normalize(np.load(os.path.join(BASE_DIR, "data/es_embeddings.npy")))
-
-with open(os.path.join(BASE_DIR, "data/gum_texts.json"), encoding="utf-8") as f:
-    gum_texts = json.load(f)
-
-with open(os.path.join(BASE_DIR, "data/es_texts.json"), encoding="utf-8") as f:
-    es_texts = json.load(f)
-
-# ============================
-# 4. Endpoint webhook
-# ============================
-@app.post("/api/webhook")
-async def webhook(request: Request):
-    data = await request.json()
-    print("Datos recibidos:", data)
-
-    if "message" in data and "text" in data["message"]:
-        chat_id = data["message"]["chat"]["id"]
-        user_message = data["message"]["text"]
-
-        direction = detect_direction(user_message)
-
-        emb = query_hf(user_message)
-        if emb is None:
-            send_message(chat_id, "⚠️ No se pudo obtener embedding desde Hugging Face.")
-            return {"status": "error"}
+class handler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        # Leer el contenido de la solicitud
+        content_length = int(self.headers['Content-Length'])
+        post_data = self.rfile.read(content_length)
         
-        if direction == "es-nmw":
-            sims = cosine_similarity([emb], gum_embeddings)[0]
-            idx = int(np.argmax(sims))
-            send_message(chat_id, f"Traducción ES→NMW: {gum_texts[idx]}")
-        else:
-            sims = cosine_similarity([emb], es_embeddings)[0]
-            idx = int(np.argmax(sims))
-            send_message(chat_id, f"Traducción NMW→ES: {es_texts[idx]}")
+        try:
+            # Parsear el JSON del webhook de Telegram
+            data = json.loads(post_data.decode('utf-8'))
+            
+            # Verificar si es un mensaje de texto
+            if 'message' in data and 'text' in data['message']:
+                chat_id = data['message']['chat']['id']
+                text = data['message']['text']
+                
+                # Procesar el mensaje
+                response = self.process_message(text, chat_id)
+                
+                # Responder con éxito
+                self.send_response(200)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({"status": "ok"}).encode())
+            else:
+                # Si no es un mensaje de texto, responder con éxito pero sin procesar
+                self.send_response(200)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({"status": "ignored"}).encode())
+                
+        except Exception as e:
+            print(f"Error: {e}")
+            self.send_response(500)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": str(e)}).encode())
+    
+    def process_message(self, text, chat_id):
+        """Procesa el mensaje y envía la respuesta traducida"""
+        try:
+            # Comando de ayuda
+            if text.lower() in ['/start', '/help']:
+                help_message = """¡Hola! 👋
+                
+Soy un bot traductor español ↔ namuy-wam
 
-    return {"status": "ok"}
+Simplemente envía una palabra en español y te doy la traducción en namuy-wam.
+
+Ejemplo:
+• Envías: hola
+• Respondo: ka watirru"""
+                
+                self.send_telegram_message(chat_id, help_message)
+                return
+            
+            # Obtener traducción de Hugging Face
+            translation = self.get_translation_from_hf(text)
+            
+            if translation:
+                # Formatear respuesta
+                response_text = f"🔄 Traducción:\n\n📝 Español: {text}\n🌿 Namuy-wam: {translation}"
+            else:
+                response_text = f"❌ No pude encontrar una traducción para '{text}'. Intenta con otra palabra."
+            
+            # Enviar respuesta por Telegram
+            self.send_telegram_message(chat_id, response_text)
+            
+        except Exception as e:
+            error_message = f"❌ Ocurrió un error al procesar tu mensaje: {str(e)}"
+            self.send_telegram_message(chat_id, error_message)
+    
+    def get_translation_from_hf(self, text):
+        """Obtiene la traducción desde la API de Hugging Face"""
+        try:
+            headers = {
+                "Authorization": f"Bearer {HF_TOKEN}",
+                "Content-Type": "application/json"
+            }
+            
+            # Payload para el modelo de embeddings
+            payload = {
+                "inputs": text,
+                "parameters": {
+                    "task": "translation",
+                    "source_lang": "es",
+                    "target_lang": "namuy-wam"
+                }
+            }
+            
+            # Realizar la petición a Hugging Face
+            response = requests.post(
+                HF_API_URL,
+                headers=headers,
+                json=payload,
+                timeout=30
+            )
+            
+            if response.status_code == 200:
+                result = response.json()
+                
+                # Adapta esto según la estructura de respuesta de tu modelo
+                # Esto es un ejemplo genérico, ajusta según tu modelo específico
+                if isinstance(result, list) and len(result) > 0:
+                    return result[0].get('generated_text', result[0].get('translation_text', None))
+                elif isinstance(result, dict):
+                    return result.get('generated_text', result.get('translation_text', None))
+                else:
+                    return str(result)
+            else:
+                print(f"Error en HF API: {response.status_code} - {response.text}")
+                return None
+                
+        except requests.exceptions.Timeout:
+            print("Timeout en la petición a Hugging Face")
+            return None
+        except requests.exceptions.RequestException as e:
+            print(f"Error en la petición a Hugging Face: {e}")
+            return None
+        except Exception as e:
+            print(f"Error inesperado en HF: {e}")
+            return None
+    
+    def send_telegram_message(self, chat_id, text):
+        """Envía un mensaje por Telegram"""
+        try:
+            url = f"{TELEGRAM_API_URL}/sendMessage"
+            payload = {
+                "chat_id": chat_id,
+                "text": text,
+                "parse_mode": "Markdown"
+            }
+            
+            response = requests.post(url, json=payload, timeout=10)
+            
+            if response.status_code != 200:
+                print(f"Error enviando mensaje por Telegram: {response.status_code} - {response.text}")
+                
+        except Exception as e:
+            print(f"Error enviando mensaje por Telegram: {e}")
+    
+    def do_GET(self):
+        # Endpoint de salud para verificar que la API funciona
+        self.send_response(200)
+        self.send_header('Content-type', 'application/json')
+        self.end_headers()
+        response = {
+            "status": "active",
+            "message": "Bot traductor español-namuy-wam funcionando"
+        }
+        self.wfile.write(json.dumps(response).encode())

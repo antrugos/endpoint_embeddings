@@ -1,5 +1,1 @@
-fastapi
-requests
-numpy
-scikit-learn
-uvicorn
+requests==2.31.0
